@@ -13,7 +13,6 @@ const char *DescribeFlags(char *, size_t, const struct DescribeFlags *, size_t,
 
 const char *DescribeArchPrctlCode(char[12], int) libcesque;
 const char *DescribeCancelState(char[12], int, int *) libcesque;
-const char *DescribeCapability(char[32], int) libcesque;
 const char *DescribeClockName(char[32], int) libcesque;
 const char *DescribeControlKeyState(char[64], uint32_t) libcesque;
 const char *DescribeDirfd(char[12], int) libcesque;
@@ -21,7 +20,6 @@ const char *DescribeDnotifyFlags(char[80], int) libcesque;
 const char *DescribeErrno(char[30], int) libcesque;
 const char *DescribeFcntlCmd(char[20], int) libcesque;
 const char *DescribeFlockType(char[12], int) libcesque;
-const char *DescribeFrame(char[32], int) libcesque;
 const char *DescribeFutexOp(char[64], int) libcesque;
 const char *DescribeHow(char[12], int) libcesque;
 const char *DescribeInOutInt64(char[23], ssize_t, int64_t *) libcesque;
@@ -48,7 +46,6 @@ const char *DescribeOpenFlags(char[128], int) libcesque;
 const char *DescribeOpenMode(char[15], int, int) libcesque;
 const char *DescribePersonalityFlags(char[128], int) libcesque;
 const char *DescribePollFlags(char[64], int) libcesque;
-const char *DescribePrctlOperation(int) libcesque;
 const char *DescribeProtFlags(char[48], int) libcesque;
 const char *DescribePtrace(char[12], int) libcesque;
 const char *DescribePtraceEvent(char[32], int) libcesque;
@@ -70,9 +67,7 @@ const char *DescribeVirtualKeyCode(char[32], uint32_t) libcesque;
 const char *DescribeWhence(char[12], int) libcesque;
 const char *DescribeWhichPrio(char[12], int) libcesque;
 
-#define DescribeArchPrctlCode(x)     DescribeArchPrctlCode(alloca(12), x)
 #define DescribeCancelState(x, y)    DescribeCancelState(alloca(12), x, y)
-#define DescribeCapability(x)        DescribeCapability(alloca(32), x)
 #define DescribeClockName(x)         DescribeClockName(alloca(32), x)
 #define DescribeControlKeyState(x)   DescribeControlKeyState(alloca(64), x)
 #define DescribeDirfd(x)             DescribeDirfd(alloca(12), x)
@@ -80,7 +75,6 @@ const char *DescribeWhichPrio(char[12], int) libcesque;
 #define DescribeErrno(x)             DescribeErrno(alloca(30), x)
 #define DescribeFcntlCmd(x)          DescribeFcntlCmd(alloca(20), x)
 #define DescribeFlockType(x)         DescribeFlockType(alloca(12), x)
-#define DescribeFrame(x)             DescribeFrame(alloca(32), x)
 #define DescribeFutexOp(x)           DescribeFutexOp(alloca(64), x)
 #define DescribeHow(x)               DescribeHow(alloca(12), x)
 #define DescribeInOutInt64(rc, x)    DescribeInOutInt64(alloca(23), rc, x)

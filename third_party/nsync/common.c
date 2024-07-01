@@ -33,6 +33,13 @@
 #include "third_party/nsync/common.internal.h"
 #include "third_party/nsync/mu_semaphore.h"
 #include "third_party/nsync/races.internal.h"
+#include "libc/runtime/runtime.h"
+#include "libc/runtime/runtime.h"
+#include "libc/sysv/consts/map.h"
+#include "libc/nt/runtime.h"
+#include "libc/intrin/directmap.internal.h"
+#include "libc/thread/thread.h"
+#include "libc/dce.h"
 #include "third_party/nsync/wait_s.internal.h"
 __static_yoink("nsync_notice");
 
@@ -149,28 +156,23 @@ waiter *nsync_dll_waiter_samecond_ (struct Dll *e) {
 
 /* -------------------------------- */
 
-static struct {
-	nsync_atomic_uint32_ mu;
-	size_t used;
-	char *p, *e;
-} malloc;
-
 static void *nsync_malloc (size_t size) {
-	void *res = 0;
-	nsync_spin_test_and_set_ (&malloc.mu, 1, 1, 0);
-	if (malloc.p + malloc.used + size > malloc.e) {
-		if (!malloc.p) {
-			malloc.p = malloc.e = (char *)kMemtrackNsyncStart;
-		}
-		malloc.e = _extend (malloc.p, malloc.used + size, malloc.e, MAP_PRIVATE,
-				    kMemtrackNsyncStart + kMemtrackNsyncSize);
-		if (!malloc.e) {
-			nsync_panic_ ("out of memory\n");
-		}
+	void *res;
+	if (!IsWindows ()) {
+		// too much of a performance hit to track
+		res = __sys_mmap ((void *)0x7110000000, size,
+				  PROT_READ | PROT_WRITE,
+				  MAP_PRIVATE | MAP_ANONYMOUS,
+				  -1, 0, 0);
+	} else {
+		// must be tracked for fork() resurrection
+		res = mmap (0, size,
+			    PROT_READ | PROT_WRITE,
+			    MAP_PRIVATE | MAP_ANONYMOUS,
+			    -1, 0);
 	}
-	res = malloc.p + malloc.used;
-	malloc.used = (malloc.used + size + 15) & -16;
-	ATM_STORE_REL (&malloc.mu, 0);
+	if (res == MAP_FAILED)
+		nsync_panic_ ("out of memory\n");
 	return res;
 }
 
@@ -179,7 +181,7 @@ static void *nsync_malloc (size_t size) {
 static struct Dll *free_waiters = NULL;
 
 /* free_waiters points to a doubly-linked list of free waiter structs. */
-static nsync_atomic_uint32_ free_waiters_mu; /* spinlock; protects free_waiters */
+nsync_atomic_uint32_ free_waiters_mu; /* spinlock; protects free_waiters */
 
 #define waiter_for_thread __get_tls()->tib_nsync
 
@@ -247,6 +249,8 @@ void nsync_waiter_free_ (waiter *w) {
 		nsync_spin_test_and_set_ (&free_waiters_mu, 1, 1, 0);
 		dll_make_first (&free_waiters, &w->nw.q);
 		ATM_STORE_REL (&free_waiters_mu, 0); /* release store */
+		if (w == waiter_for_thread)
+			waiter_for_thread = 0;
 	}
 }
 

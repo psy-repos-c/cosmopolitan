@@ -24,6 +24,8 @@
 #include "libc/thread/tls.h"
 #include "third_party/dlmalloc/vespene.internal.h"
 #include "libc/thread/tls.h"
+#include "libc/intrin/kprintf.h"
+#include "libc/intrin/kprintf.h"
 #include "third_party/nsync/mu.h"
 
 #if !IsTiny()
@@ -1220,7 +1222,8 @@ static void internal_inspect_all(mstate m,
           }
         }
         if (start < (void*)next)  /* skip if all space is bookkeeping */
-          handler(start, next, used, arg);
+          if (start != s) /* [jart] fix phantom alloc bug w/ mspace+mmap */
+            handler(start, next, used, arg);
         if (q == top)
           break;
         q = next;

@@ -3,8 +3,8 @@
 #endif
 
 #define __COSMOPOLITAN_MAJOR__ 3
-#define __COSMOPOLITAN_MINOR__ 4
-#define __COSMOPOLITAN_PATCH__ 0
+#define __COSMOPOLITAN_MINOR__ 5
+#define __COSMOPOLITAN_PATCH__ 4
 #define __COSMOPOLITAN__                                                   \
   (100000000 * __COSMOPOLITAN_MAJOR__ + 1000000 * __COSMOPOLITAN_MINOR__ + \
    __COSMOPOLITAN_PATCH__)
@@ -84,7 +84,6 @@
 #endif
 
 #ifdef _COSMO_SOURCE
-#define FRAMESIZE 65536
 #define _PAGESIZE 4096
 #endif
 

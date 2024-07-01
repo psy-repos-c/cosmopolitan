@@ -17,14 +17,18 @@
 │ PERFORMANCE OF THIS SOFTWARE.                                                │
 ╚─────────────────────────────────────────────────────────────────────────────*/
 #include "ape/sections.internal.h"
+#include "libc/assert.h"
+#include "libc/atomic.h"
 #include "libc/calls/internal.h"
 #include "libc/calls/sig.internal.h"
 #include "libc/calls/state.internal.h"
 #include "libc/calls/syscall_support-nt.internal.h"
 #include "libc/errno.h"
 #include "libc/fmt/itoa.h"
+#include "libc/intrin/atomic.h"
 #include "libc/intrin/directmap.internal.h"
 #include "libc/intrin/kprintf.h"
+#include "libc/intrin/maps.h"
 #include "libc/intrin/strace.internal.h"
 #include "libc/intrin/weaken.h"
 #include "libc/macros.internal.h"
@@ -41,11 +45,14 @@
 #include "libc/nt/runtime.h"
 #include "libc/nt/signals.h"
 #include "libc/nt/struct/ntexceptionpointers.h"
+#include "libc/nt/thread.h"
+#include "libc/nt/thunk/msabi.h"
 #include "libc/proc/ntspawn.h"
 #include "libc/proc/proc.internal.h"
 #include "libc/runtime/internal.h"
 #include "libc/runtime/memtrack.internal.h"
 #include "libc/runtime/runtime.h"
+#include "libc/runtime/stack.h"
 #include "libc/runtime/symbols.internal.h"
 #include "libc/str/str.h"
 #include "libc/sysv/consts/at.h"
@@ -55,10 +62,14 @@
 #include "libc/sysv/consts/sig.h"
 #include "libc/sysv/errfuns.h"
 #include "libc/thread/itimer.internal.h"
+#include "libc/thread/posixthread.internal.h"
 #include "libc/thread/tls.h"
 #ifdef __x86_64__
 
+extern long __klog_handle;
+extern atomic_uint free_waiters_mu;
 void WipeKeystrokes(void);
+__msabi extern typeof(GetCurrentProcessId) *const __imp_GetCurrentProcessId;
 
 static textwindows wontreturn void AbortFork(const char *func) {
 #if SYSDEBUG
@@ -84,11 +95,9 @@ static inline textwindows ssize_t ForkIo(int64_t h, char *p, size_t n,
                                                      struct NtOverlapped *)) {
   size_t i;
   uint32_t x;
-  for (i = 0; i < n; i += x) {
-    if (!f(h, p + i, n - i, &x, NULL)) {
+  for (i = 0; i < n; i += x)
+    if (!f(h, p + i, n - i, &x, NULL))
       return __winerr();
-    }
-  }
   return i;
 }
 
@@ -98,8 +107,11 @@ static dontinline textwindows bool ForkIo2(int64_t h, void *buf, size_t n,
                                                         struct NtOverlapped *),
                                            const char *sf, bool ischild) {
   ssize_t rc = ForkIo(h, buf, n, fn);
-  if (ischild)
+  if (ischild) {
     __tls_enabled_set(false);  // prevent tls crash in kprintf
+    __pid = __imp_GetCurrentProcessId();
+    __klog_handle = 0;
+  }
   NTTRACE("%s(%ld, %p, %'zu) → %'zd% m", sf, h, buf, n, rc);
   return rc != -1;
 }
@@ -139,9 +151,8 @@ static textwindows dontinline void ReadOrDie(int64_t h, void *buf, size_t n) {
 static textwindows int64_t MapOrDie(uint32_t prot, uint64_t size) {
   int64_t h;
   for (;;) {
-    if ((h = CreateFileMapping(-1, 0, prot, size >> 32, size, 0))) {
+    if ((h = CreateFileMapping(-1, 0, prot, size >> 32, size, 0)))
       return h;
-    }
     if (GetLastError() == kNtErrorAccessDenied) {
       switch (prot) {
         case kNtPageExecuteWritecopy:
@@ -183,16 +194,17 @@ static __msabi textwindows int OnForkCrash(struct NtExceptionPointers *ep) {
   TerminateThisProcess(SIGSTKFLT);
 }
 
+static textwindows void *Malloc(size_t size) {
+  return HeapAlloc(GetProcessHeap(), 0, size);
+}
+
 textwindows void WinMainForked(void) {
   jmp_buf jb;
   int64_t reader;
   int64_t savetsc;
-  char *addr, *shad;
-  uint64_t size, upsize;
-  struct MemoryInterval *maps;
+  struct Map *map;
+  uint32_t varlen, oldprot;
   char16_t fvar[21 + 1 + 21 + 1];
-  uint32_t i, varlen, oldprot, savepid;
-  long mapcount, mapcapacity, specialz;
   struct Fds *fds = __veil("r", &g_fds);
 
   // check to see if the process was actually forked
@@ -200,7 +212,7 @@ textwindows void WinMainForked(void) {
   varlen = GetEnvironmentVariable(u"_FORK", fvar, ARRAYLEN(fvar));
   if (!varlen || varlen >= ARRAYLEN(fvar))
     return;
-  NTTRACE("WinMainForked()");
+  /* STRACE("WinMainForked()"); */
   SetEnvironmentVariable(u"_FORK", NULL);
 #if SYSDEBUG
   int64_t oncrash = AddVectoredExceptionHandler(1, (void *)OnForkCrash);
@@ -208,69 +220,64 @@ textwindows void WinMainForked(void) {
   ParseInt(fvar, &reader);
 
   // read the cpu state from the parent process & plus
-  // read the list of mappings from the parent process
-  // this is stored in a special secretive memory map!
-  // read ExtendMemoryIntervals for further details :|
-  maps = (void *)kMemtrackStart;
   ReadOrDie(reader, jb, sizeof(jb));
-  ReadOrDie(reader, &mapcount, sizeof(_mmi.i));
-  ReadOrDie(reader, &mapcapacity, sizeof(_mmi.n));
-  specialz = ROUNDUP(mapcapacity * sizeof(_mmi.p[0]), kMemtrackGran);
-  ViewOrDie(MapOrDie(kNtPageReadwrite, specialz), kNtFileMapWrite, 0, specialz,
-            maps);
-  ReadOrDie(reader, maps, mapcount * sizeof(_mmi.p[0]));
-  if (IsAsan()) {
-    shad = (char *)(((intptr_t)maps >> 3) + 0x7fff8000);
-    size = ROUNDUP(specialz >> 3, FRAMESIZE);
-    ViewOrDie(MapOrDie(kNtPageReadwrite, size), kNtFileMapWrite, 0, size, shad);
-    ReadOrDie(reader, shad, (mapcount * sizeof(_mmi.p[0])) >> 3);
-  }
 
-  // read the heap mappings from the parent process
-  for (i = 0; i < mapcount; ++i) {
-    addr = (char *)((uint64_t)maps[i].x << 16);
-    size = maps[i].size;
-    if ((maps[i].flags & MAP_TYPE) != MAP_SHARED) {
-      upsize = ROUNDUP(size, FRAMESIZE);
+  // read memory mappings from parent process
+  struct Map *maps = __maps.maps;
+  for (;;) {
+    map = Malloc(sizeof(*map));
+    ReadOrDie(reader, map, sizeof(*map));
+    if ((map->flags & MAP_TYPE) != MAP_SHARED) {
       // we don't need to close the map handle because sys_mmap_nt
       // doesn't mark it inheritable across fork() for MAP_PRIVATE
-      ViewOrDie((maps[i].h = MapOrDie(kNtPageExecuteReadwrite, upsize)),
-                kNtFileMapWrite | kNtFileMapExecute, 0, upsize, addr);
-      ReadOrDie(reader, addr, size);
+      ViewOrDie((map->h = MapOrDie(kNtPageExecuteReadwrite, map->size)),
+                kNtFileMapWrite | kNtFileMapExecute, 0, map->size, map->addr);
+      ReadOrDie(reader, map->addr, map->size);
     } else {
       // we can however safely inherit MAP_SHARED with zero copy
-      ViewOrDie(maps[i].h,
-                maps[i].readonlyfile ? kNtFileMapRead | kNtFileMapExecute
-                                     : kNtFileMapWrite | kNtFileMapExecute,
-                maps[i].offset, size, addr);
+      ViewOrDie(map->h,
+                map->readonlyfile ? kNtFileMapRead | kNtFileMapExecute
+                                  : kNtFileMapWrite | kNtFileMapExecute,
+                map->off, map->size, map->addr);
     }
+    dll_init(&map->elem);
+    bool isdone = !map->next;
+    map->next = maps;
+    maps = map;
+    if (isdone)
+      break;
   }
 
   // read the .data and .bss program image sections
-  savepid = __pid;
   savetsc = kStartTsc;
   ReadOrDie(reader, __data_start, __data_end - __data_start);
   ReadOrDie(reader, __bss_start, __bss_end - __bss_start);
-  __pid = savepid;
   kStartTsc = savetsc;
   __threaded = false;
   __tls_index = 0;
   __tls_enabled_set(false);
 
-  // apply fixups and reapply memory protections
-  _mmi.p = maps;
-  _mmi.n = specialz / sizeof(_mmi.p[0]);
-  for (i = 0; i < mapcount; ++i) {
-    if (!VirtualProtect((void *)((uint64_t)maps[i].x << 16), maps[i].size,
-                        __prot2nt(maps[i].prot, maps[i].iscow), &oldprot)) {
+  // fixup memory manager
+  __maps.free = 0;
+  __maps.used = 0;
+  __maps.maps = maps;
+  __maps.count = 0;
+  __maps.pages = 0;
+  dll_init(&__maps.stack.elem);
+  dll_make_first(&__maps.used, &__maps.stack.elem);
+  for (struct Map *map = maps; map; map = map->next) {
+    __maps.count += 1;
+    __maps.pages += (map->size + 4095) / 4096;
+    dll_make_last(&__maps.used, &map->elem);
+    if (!VirtualProtect(map->addr, map->size, __prot2nt(map->prot, map->iscow),
+                        &oldprot))
       AbortFork("VirtualProtect");
-    }
   }
+  __maps_init();
 
   // mitosis complete
-  if (!CloseHandle(reader)) {
+  if (!CloseHandle(reader))
     AbortFork("CloseHandle");
-  }
 
   // rewrap the stdin named pipe hack
   // since the handles closed on fork
@@ -295,7 +302,7 @@ textwindows int sys_fork_nt(uint32_t dwCreationFlags) {
   jmp_buf jb;
   uint32_t op;
   char **args;
-  int i, rc = -1;
+  int rc = -1;
   struct Proc *proc;
   struct CosmoTib *tib;
   char16_t pipename[64];
@@ -304,10 +311,10 @@ textwindows int sys_fork_nt(uint32_t dwCreationFlags) {
   struct NtProcessInformation procinfo;
   char *p, forkvar[6 + 21 + 1 + 21 + 1];
   tib = __get_tls();
-  ftrace_enabled(-1);
-  strace_enabled(-1);
   if (!(proc = __proc_new()))
     return -1;
+  ftrace_enabled(-1);
+  strace_enabled(-1);
   if (!setjmp(jb)) {
     reader = CreateNamedPipe(__create_pipe_name(pipename), kNtPipeAccessInbound,
                              kNtPipeTypeByte | kNtPipeReadmodeByte, 1, PIPE_BUF,
@@ -324,6 +331,7 @@ textwindows int sys_fork_nt(uint32_t dwCreationFlags) {
       startinfo.hStdError = g_fds.p[2].handle;
       args = __argv;
 #if SYSDEBUG
+      int i;
       // If --strace was passed to this program, then propagate it the
       // forked process since the flag was removed by __intercept_flag
       if (strace_enabled(0) > 0) {
@@ -350,22 +358,17 @@ textwindows int sys_fork_nt(uint32_t dwCreationFlags) {
           &procinfo});
       if (spawnrc != -1) {
         CloseHandle(procinfo.hThread);
-        ok = WriteAll(writer, jb, sizeof(jb)) &&
-             WriteAll(writer, &_mmi.i, sizeof(_mmi.i)) &&
-             WriteAll(writer, &_mmi.n, sizeof(_mmi.n)) &&
-             WriteAll(writer, _mmi.p, _mmi.i * sizeof(_mmi.p[0]));
-        if (IsAsan() && ok) {
-          ok = WriteAll(writer, (char *)(((intptr_t)_mmi.p >> 3) + 0x7fff8000),
-                        (_mmi.i * sizeof(_mmi.p[0])) >> 3);
-        }
-        for (i = 0; i < _mmi.i && ok; ++i) {
-          if ((_mmi.p[i].flags & MAP_TYPE) != MAP_SHARED) {
-            char *p = (char *)((uint64_t)_mmi.p[i].x << 16);
+        ok = WriteAll(writer, jb, sizeof(jb));
+        for (struct Map *map = __maps.maps; ok && map; map = map->next) {
+          if (MAX((char *)__executable_start, map->addr) <
+              MIN((char *)_end, map->addr + map->size))
+            continue;  // executable image is loaded by windows
+          ok = WriteAll(writer, map, sizeof(*map));
+          if (ok && (map->flags & MAP_TYPE) != MAP_SHARED) {
             // XXX: forking destroys thread guard pages currently
-            VirtualProtect(
-                p, _mmi.p[i].size,
-                __prot2nt(_mmi.p[i].prot | PROT_READ, _mmi.p[i].iscow), &op);
-            ok = WriteAll(writer, p, _mmi.p[i].size);
+            VirtualProtect(map->addr, map->size,
+                           __prot2nt(map->prot | PROT_READ, map->iscow), &op);
+            ok = WriteAll(writer, map->addr, map->size);
           }
         }
         if (ok)
@@ -416,10 +419,12 @@ textwindows int sys_fork_nt(uint32_t dwCreationFlags) {
     if (_weaken(__itimer_wipe)) {
       _weaken(__itimer_wipe)();
     }
+    // notify pthread join
+    atomic_store_explicit(&_pthread_static.ptid, GetCurrentThreadId(),
+                          memory_order_release);
   }
-  if (rc == -1) {
+  if (rc == -1)
     dll_make_first(&__proc.free, &proc->elem);
-  }
   ftrace_enabled(+1);
   strace_enabled(+1);
   return rc;
